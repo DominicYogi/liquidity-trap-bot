@@ -1,25 +1,42 @@
-def find_trap_zones(df, buffer_pct=0.05):
-    highs = df['high']
-    lows = df['low']
+import numpy as np
+
+def find_trap_zones(df, wick_tolerance=0.0015, min_touches=3):
+    """
+    Find liquidity trap zones based on wick clustering.
+
+    wick_tolerance: max % difference to group touches
+    min_touches: minimum number of wick touches to mark zone
+    """
+
+    highs = df['high'].values
+    lows = df['low'].values
+
     trap_zones = []
 
-    for i in range(10, len(df)):
-        recent_highs = highs[i-10:i]
-        recent_lows = lows[i-10:i]
+    # Combine highs and lows for clustering
+    wick_points = np.concatenate([highs, lows])
 
-        highest_high = recent_highs.max()
-        lowest_low = recent_lows.min()
+    # Sort wick points
+    wick_points.sort()
 
-        # Trap above equal highs
-        similar_highs = recent_highs[(recent_highs > highest_high * (1 - buffer_pct)) & 
-                                     (recent_highs < highest_high * (1 + buffer_pct))]
-        if len(similar_highs) >= 2:
-            trap_zones.append({'type': 'stop-above-high', 'price': highest_high})
+    # Group wick points by closeness (within wick_tolerance)
+    clusters = []
+    cluster = [wick_points[0]]
 
-        # Trap below equal lows
-        similar_lows = recent_lows[(recent_lows > lowest_low * (1 - buffer_pct)) & 
-                                   (recent_lows < lowest_low * (1 + buffer_pct))]
-        if len(similar_lows) >= 2:
-            trap_zones.append({'type': 'stop-below-low', 'price': lowest_low})
+    for price in wick_points[1:]:
+        if abs(price - cluster[-1]) / cluster[-1] <= wick_tolerance:
+            cluster.append(price)
+        else:
+            if len(cluster) >= min_touches:
+                clusters.append(cluster)
+            cluster = [price]
+    # Check last cluster
+    if len(cluster) >= min_touches:
+        clusters.append(cluster)
+
+    # Build trap zones from clusters (average price)
+    for c in clusters:
+        avg_price = np.mean(c)
+        trap_zones.append({'price': avg_price, 'touches': len(c)})
 
     return trap_zones
