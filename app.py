@@ -1,57 +1,108 @@
 import streamlit as st
-from price_fetcher import get_candles
-from trap_detector import find_trap_zones
-from trade_simulator import simulate_trades
+import requests
+import pandas as pd
 import plotly.graph_objects as go
+from trap_detector import find_trap_zones, generate_signals
 
 st.set_page_config(page_title="Liquidity Trap Bot", layout="wide")
-st.title("💥 Liquidity Trap Bot — Stop Hunt Detector & Simulator")
 
-symbol = st.selectbox("Symbol", ['BTCUSDT', 'ETHUSDT'])
-interval = st.selectbox("Candle Interval", ['1m', '5m', '15m', '1h'])
-wick_tolerance = st.slider("Wick Clustering Tolerance (%)", 0.05, 1.0, 0.15) / 100
-min_touches = st.slider("Min Wick Touches", 2, 5, 3)
-stop_loss_pct = st.slider("Stop Loss (%)", 0.1, 5.0, 0.2) / 100
-take_profit_pct = st.slider("Take Profit (%)", 0.1, 10.0, 0.4) / 100
+API_KEY = "B7S360OVQWAXAU6K"
 
-with st.spinner("Fetching data..."):
-    df = get_candles(symbol, interval)
+@st.cache_data(ttl=600)
+def fetch_forex_data(from_symbol, to_symbol, interval, api_key):
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "FX_INTRADAY",
+        "from_symbol": from_symbol,
+        "to_symbol": to_symbol,
+        "interval": interval,
+        "apikey": api_key,
+        "outputsize": "compact"
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
 
-trap_zones = find_trap_zones(df, wick_tolerance, min_touches)
-trades = simulate_trades(df, trap_zones, stop_loss_pct, take_profit_pct)
+    key = f"Time Series FX ({interval})"
+    if key not in data:
+        st.error(f"API Error or Rate Limit: {data.get('Note', data)}")
+        return None
 
-fig = go.Figure()
-fig.add_trace(go.Candlestick(
-    x=df['timestamp'],
-    open=df['open'], high=df['high'],
-    low=df['low'], close=df['close'],
-    name='Price'
-))
+    ts = data[key]
+    df = pd.DataFrame.from_dict(ts, orient="index")
+    df = df.rename(columns={
+        "1. open": "open",
+        "2. high": "high",
+        "3. low": "low",
+        "4. close": "close"
+    })
 
-for zone in trap_zones:
-    fig.add_hline(y=zone['price'], line_color='orange', annotation_text=f"Trap Zone ({zone['touches']} touches)", opacity=0.3)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
 
-for trade in trades:
-    color = 'green' if trade['outcome'] == 'win' else 'red'
-    fig.add_vline(x=trade['entry_time'], line_dash='dot', line_color=color)
-    fig.add_vline(x=trade['exit_time'], line_dash='dash', line_color=color)
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    df.reset_index(inplace=True)
+    df.rename(columns={"index": "timestamp"}, inplace=True)
+    return df
 
-st.plotly_chart(fig, use_container_width=True)
+def plot_candles(df, trap_zones, signals):
+    fig = go.Figure(data=[go.Candlestick(
+        x=df['timestamp'],
+        open=df['open'],
+        high=df['high'],
+        low=df['low'],
+        close=df['close'],
+        name="Candles"
+    )])
 
-st.subheader("Simulated Trades")
+    # Plot trap zones as horizontal lines
+    for zone in trap_zones:
+        fig.add_hline(y=zone, line_color='red', line_dash='dash', annotation_text='Trap Zone', annotation_position="top left")
 
-if not trades:
-    st.info("No simulated trades detected based on current parameters.")
-else:
-    wins = sum(t['outcome'] == 'win' for t in trades)
-    losses = sum(t['outcome'] == 'loss' for t in trades)
-    win_rate = wins / len(trades) * 100
+    # Plot signals as scatter
+    for sig in signals:
+        color = 'green' if sig['signal'] == 'BUY' else 'red'
+        fig.add_trace(go.Scatter(
+            x=[sig['timestamp']],
+            y=[sig['price']],
+            mode='markers',
+            marker=dict(color=color, size=12, symbol='triangle-up' if sig['signal'] == 'BUY' else 'triangle-down'),
+            name=f"{sig['signal']} Signal"
+        ))
 
-    st.write(f"Total Trades: {len(trades)}")
-    st.write(f"Wins: {wins}")
-    st.write(f"Losses: {losses}")
-    st.write(f"Win Rate: {win_rate:.2f}%")
+    fig.update_layout(
+        title="Liquidity Trap Zones & Signals",
+        xaxis_title="Time",
+        yaxis_title="Price",
+        xaxis_rangeslider_visible=False,
+        height=600
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    for i, trade in enumerate(trades[-10:]):
-        st.write(f"{i+1}. {trade['outcome'].upper()} | Entry: {trade['entry_price']:.2f} at {trade['entry_time']} | Exit: {trade['exit_price']:.2f} at {trade['exit_time']} | Profit: {trade['profit']:.2f}")
+def main():
+    st.title("Liquidity Trap Bot")
 
+    col1, col2 = st.columns(2)
+    with col1:
+        symbol_option = st.selectbox("Select Forex Pair", options=["EURUSD", "USDCAD"])
+        interval = st.selectbox("Select Interval", options=["5min", "15min", "30min"], index=1)
+    with col2:
+        wick_tolerance = st.slider("Wick Tolerance (%)", 1, 20, 10) / 100
+        min_touches = st.slider("Min Touches for Zone", 1, 5, 2)
+        signal_tolerance = st.slider("Signal Proximity Tolerance (pips)", 1, 20, 5) / 10000
+
+    from_symbol = symbol_option[:3]
+    to_symbol = symbol_option[3:]
+
+    if st.button("Run Liquidity Trap Detection"):
+        df = fetch_forex_data(from_symbol, to_symbol, interval, API_KEY)
+        if df is not None:
+            trap_zones = find_trap_zones(df, wick_tolerance=wick_tolerance, min_touches=min_touches)
+            st.write(f"Detected {len(trap_zones)} Liquidity Trap Zones.")
+            signals = generate_signals(df, trap_zones, tolerance=signal_tolerance)
+            st.write(f"Generated {len(signals)} Trade Signals.")
+
+            plot_candles(df, trap_zones, signals)
+
+if __name__ == "__main__":
+    main()
